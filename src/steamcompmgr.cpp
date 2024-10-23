@@ -149,6 +149,7 @@ extern int g_nDynamicRefreshHz;
 bool g_bForceHDRSupportDebug = false;
 bool g_bHackyEnabled = false;
 bool g_bVRRModesetting = false;
+bool g_refreshHalve = false;
 bool vrr_requested = false;
 extern float g_flInternalDisplayBrightnessNits;
 extern float g_flHDRItmSdrNits;
@@ -2264,7 +2265,7 @@ bool ShouldDrawCursor()
 }
 
 static void
-paint_all(bool async)
+paint_all(bool async, bool vrr)
 {
 	gamescope_xwayland_server_t *root_server = wlserver_get_xwayland_server(0);
 	xwayland_ctx_t *root_ctx = root_server->ctx.get();
@@ -2313,7 +2314,7 @@ paint_all(bool async)
 	struct FrameInfo_t frameInfo = {};
 	frameInfo.applyOutputColorMgmt = g_ColorMgmt.pending.enabled;
 	frameInfo.outputEncodingEOTF = g_ColorMgmt.pending.outputEncodingEOTF;
-	frameInfo.allowVRR = cv_adaptive_sync;
+	frameInfo.allowVRR = vrr;
 	frameInfo.bFadingOut = fadingOut;
 
 	// If the window we'd paint as the base layer is the streaming client,
@@ -5099,22 +5100,27 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vblank_idx )
 {
-	if ( GetBackend()->IsVRRActive() )
+	if ( GetBackend()->IsVRRActive() && !g_refreshHalve )
 		return true;
-
-	bool bSendCallback = true;
 
 	int nRefreshHz = gamescope::ConvertmHzToHz( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh );
 	int nTargetFPS = g_nSteamCompMgrTargetFPS;
-	if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
+
+	if ( nRefreshHz > 60 && g_refreshHalve )
+	{
+		// Refresh halve above 60Hz if steamui is active
+		if ( vblank_idx % 2 != 0 )
+			return false;
+	}
+	else if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && nRefreshHz > nTargetFPS )
 	{
 		int nVblankDivisor = nRefreshHz / nTargetFPS;
 
 		if ( vblank_idx % nVblankDivisor != 0 )
-			bSendCallback = false;
+			return false;
 	}
 
-	return bSendCallback;
+	return true;
 }
 
 static bool steamcompmgr_should_vblank_window( steamcompmgr_win_t *w, uint64_t vblank_idx )
@@ -7626,7 +7632,16 @@ steamcompmgr_main(int argc, char **argv)
 		const bool bIsVBlankFromTimer = vblank;
 
 		// We can always vblank if VRR.
-		const bool bVRR = GetBackend()->IsVRRActive();
+		bool bVRR = GetBackend()->IsVRRActive();
+
+		if ( window_is_steam( global_focus.focusWindow ) ) {
+			// Halve refresh rate and disable vrr on SteamUI
+			bVRR = false;
+			g_refreshHalve = true;
+		} else {
+			g_refreshHalve = false;
+		}
+
 		if ( bVRR )
 			vblank = true;
 
@@ -8033,7 +8048,7 @@ steamcompmgr_main(int argc, char **argv)
 
 		if ( bShouldPaint )
 		{
-			paint_all( eFlipType == FlipType::Async );
+			paint_all( eFlipType == FlipType::Async, bVRR );
 
 			hasRepaint = false;
 			hasRepaintNonBasePlane = false;
