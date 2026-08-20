@@ -53,6 +53,10 @@
 #include "libdisplay-info/cta.h"
 #include "wlr_end.hpp"
 
+#if HAVE_GBM
+#include <gbm.h>
+#endif
+
 #include "gamescope-control-protocol.h"
 
 extern int g_nPreferredOutputWidth;
@@ -109,6 +113,10 @@ struct drm_t {
 	uint64_t cursor_width, cursor_height;
 	bool allow_modifiers;
 	struct wlr_drm_format_set formats;
+	bool is_nvidia = false;
+#if HAVE_GBM
+	struct gbm_device *gbm = nullptr;
+#endif
 
 	std::vector< std::unique_ptr< gamescope::CDRMPlane > > planes;
 	std::vector< std::unique_ptr< gamescope::CDRMCRTC > > crtcs;
@@ -1291,6 +1299,18 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 		return false;
 	}
 
+	drm->is_nvidia = false;
+	if ( drmVersion *pVersion = drmGetVersion( drm->fd ) )
+	{
+		drm->is_nvidia = pVersion->name && strcmp( pVersion->name, "nvidia-drm" ) == 0;
+		drmFreeVersion( pVersion );
+	}
+
+#if !HAVE_GBM
+	if ( drm->is_nvidia )
+		drm_log.errorf( "Gamescope was built without GBM support; Vulkan scanout allocation will be used on NVIDIA." );
+#endif
+
 	if (drmGetCap(drm->fd, DRM_CAP_CURSOR_WIDTH, &drm->cursor_width) != 0) {
 		drm->cursor_width = 64;
 	}
@@ -1450,6 +1470,15 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 
 	drm->needs_modeset = true;
 
+#if HAVE_GBM
+	if ( drm->is_nvidia )
+	{
+		drm->gbm = gbm_create_device( drm->fd );
+		if ( !drm->gbm )
+			drm_log.errorf( "Failed to create GBM device for NVIDIA scanout buffers; Vulkan scanout allocation will be used." );
+	}
+#endif
+
 	return true;
 }
 
@@ -1607,6 +1636,14 @@ void finish_drm(struct drm_t *drm)
 	drm->planes.clear();
 	drm->crtcs.clear();
 	drm->connectors.clear();
+
+#if HAVE_GBM
+	if ( drm->gbm )
+	{
+		gbm_device_destroy( drm->gbm );
+		drm->gbm = nullptr;
+	}
+#endif
 
 
 	// Signal the page-flip handler thread to exit and join it so it won't be
@@ -3643,12 +3680,15 @@ namespace gamescope
 				}
 			}
 
+			const bool bForceBackendComposition = UsesBackendAllocatedScanout();
 			bool bLayer0ScreenSize = close_enough(pFrameInfo->layers.get( 0 ).scale.x, 1.0f) && close_enough(pFrameInfo->layers.get( 0 ).scale.y, 1.0f);
 
 			bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
 
 			bool bNeedsFullComposite = false;
 			bNeedsFullComposite |= cv_composite_force;
+			// NVIDIA client DMA-BUFs have no physical-contiguity guarantee.
+			bNeedsFullComposite |= bForceBackendComposition;
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
@@ -3946,6 +3986,71 @@ namespace gamescope
 		virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override
 		{
 			return drm_fbid_from_dmabuf( &g_DRM, pDmaBuf );
+		}
+
+		virtual bool UsesBackendAllocatedScanout() const override
+		{
+			return g_DRM.is_nvidia;
+		}
+
+		virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+		                                  std::span<const uint64_t> ulModifiers,
+		                                  wlr_dmabuf_attributes *pDmaBuf ) override
+		{
+#if HAVE_GBM
+			if ( !g_DRM.gbm || ulModifiers.empty() )
+				return false;
+
+			struct gbm_bo *pBo = gbm_bo_create_with_modifiers2(
+				g_DRM.gbm, uWidth, uHeight, uDrmFormat,
+				ulModifiers.data(), ulModifiers.size(),
+				GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT );
+			if ( !pBo )
+			{
+				drm_log.errorf_errno( "Failed to allocate NVIDIA GBM scanout buffer" );
+				return false;
+			}
+
+			*pDmaBuf = {
+				.width = int32_t( uWidth ),
+				.height = int32_t( uHeight ),
+				.format = uDrmFormat,
+				.modifier = gbm_bo_get_modifier( pBo ),
+			};
+
+			const int nPlanes = gbm_bo_get_plane_count( pBo );
+			bool bSuccess = nPlanes >= 1 && nPlanes <= WLR_DMABUF_MAX_PLANES &&
+				Algorithm::Contains( ulModifiers, pDmaBuf->modifier );
+
+			for ( int i = 0; bSuccess && i < nPlanes; i++ )
+			{
+				const int nFd = gbm_bo_get_fd_for_plane( pBo, i );
+				if ( nFd < 0 )
+				{
+					drm_log.errorf_errno( "Failed to export NVIDIA GBM scanout buffer" );
+					bSuccess = false;
+					break;
+				}
+
+				pDmaBuf->fd[i] = nFd;
+				pDmaBuf->offset[i] = gbm_bo_get_offset( pBo, i );
+				pDmaBuf->stride[i] = gbm_bo_get_stride_for_plane( pBo, i );
+				pDmaBuf->n_planes = i + 1;
+			}
+
+			gbm_bo_destroy( pBo );
+
+			if ( !bSuccess || pDmaBuf->n_planes != nPlanes )
+			{
+				wlr_dmabuf_attributes_finish( pDmaBuf );
+				*pDmaBuf = {};
+				return false;
+			}
+
+			return true;
+#else
+			return false;
+#endif
 		}
 
 		virtual bool UsesModifiers() const override

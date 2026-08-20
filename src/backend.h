@@ -341,6 +341,17 @@ namespace gamescope
         // Rc manages acquire/release of buffer to/from client while imported.
         virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) = 0;
 
+        // Some KMS drivers impose placement constraints that Vulkan external
+        // allocations cannot express. Such backends may allocate the final
+        // scanout buffer themselves and let Vulkan import it.
+        virtual bool UsesBackendAllocatedScanout() const { return false; }
+        virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,
+                                          std::span<const uint64_t> ulModifiers,
+                                          wlr_dmabuf_attributes *pDmaBuf )
+        {
+            return false;
+        }
+
         virtual bool UsesModifiers() const = 0;
         virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const = 0;
 		inline bool SupportsFormat( uint32_t uDrmFormat ) const

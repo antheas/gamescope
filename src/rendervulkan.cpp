@@ -2048,7 +2048,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	}
 
-	if ( flags.bFlippable == true )
+	if ( flags.bFlippable == true && pDMA == nullptr )
 	{
 		flags.bExportable = true;
 	}
@@ -2263,6 +2263,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		vk_errorf( res, "vkCreateImage failed" );
 		return false;
 	}
+	m_bOwnsImage = true;
 	
 	VkMemoryRequirements memRequirements;
 	g_device.vk.GetImageMemoryRequirements(g_device.device(), m_vkImage, &memRequirements);
@@ -2326,6 +2327,31 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 				return false;
 			}
 
+			VkMemoryFdPropertiesKHR fdProperties = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+			};
+			res = g_device.vk.GetMemoryFdPropertiesKHR(
+				g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+				fd, &fdProperties );
+			if ( res != VK_SUCCESS )
+			{
+				vk_errorf( res, "vkGetMemoryFdPropertiesKHR failed" );
+				close( fd );
+				return false;
+			}
+
+			const uint32_t uMemoryTypeBits = memRequirements.memoryTypeBits & fdProperties.memoryTypeBits;
+			int32_t nMemoryType = g_device.findMemoryType( properties, uMemoryTypeBits );
+			if ( nMemoryType < 0 )
+				nMemoryType = g_device.findMemoryType( 0, uMemoryTypeBits );
+			if ( nMemoryType < 0 )
+			{
+				vk_log.errorf( "No compatible Vulkan memory type for scanout DMA-BUF import" );
+				close( fd );
+				return false;
+			}
+			allocInfo.memoryTypeIndex = uint32_t( nMemoryType );
+
 			// Memory already provided by pDMA
 			importMemoryInfo = {
 					.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
@@ -2338,6 +2364,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		res = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &memoryHandle );
 		if ( res != VK_SUCCESS )
 		{
+			if ( pDMA != nullptr )
+				close( importMemoryInfo.fd );
 			vk_errorf( res, "vkAllocateMemory failed" );
 			if ( pDMA != nullptr )
 			{
@@ -2490,13 +2518,30 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		m_dmabuf = dmabuf;
 	}
+	else if ( pDMA != nullptr && flags.bFlippable == true )
+	{
+		m_dmabuf = *pDMA;
+		m_dmabuf.n_planes = 0;
+		for ( int i = 0; i < pDMA->n_planes; i++ )
+		{
+			m_dmabuf.fd[i] = dup( pDMA->fd[i] );
+			if ( m_dmabuf.fd[i] < 0 )
+			{
+				vk_log.errorf_errno( "dup failed" );
+				return false;
+			}
+			m_dmabuf.n_planes = i + 1;
+		}
+	}
 
 	if ( flags.bFlippable == true )
 	{
 		m_pBackendFb = GetBackend()->ImportDmabufToBackend( &m_dmabuf );
+		if ( pDMA != nullptr && m_pBackendFb == nullptr )
+			return false;
 	}
 
-	bool bHasAlpha = pDMA ? DRMFormatHasAlpha( pDMA->format ) : true;
+	bool bHasAlpha = ( pDMA && !flags.bOutputImage ) ? DRMFormatHasAlpha( pDMA->format ) : true;
 
 	if (!bHasAlpha )
 	{
@@ -2710,14 +2755,15 @@ CVulkanTexture::~CVulkanTexture( void )
 	if ( m_pBackendFb != nullptr )
 		m_pBackendFb = nullptr;
 
+	if ( m_vkImage != VK_NULL_HANDLE && m_bOwnsImage )
+	{
+		g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
+		m_vkImage = VK_NULL_HANDLE;
+		m_bOwnsImage = false;
+	}
+
 	if ( m_vkImageMemory != VK_NULL_HANDLE )
 	{
-		if ( m_vkImage != VK_NULL_HANDLE )
-		{
-			g_device.vk.DestroyImage( g_device.device(), m_vkImage, nullptr );
-			m_vkImage = VK_NULL_HANDLE;
-		}
-
 		g_device.vk.FreeMemory( g_device.device(), m_vkImageMemory, nullptr );
 		m_vkImageMemory = VK_NULL_HANDLE;
 	}
@@ -3284,6 +3330,63 @@ bool vulkan_remake_swapchain( void )
 	return bRet;
 }
 
+static std::vector<uint64_t> vulkan_get_backend_scanout_modifiers( VulkanOutput_t *pOutput )
+{
+	std::vector<uint64_t> modifiers;
+	const bool bHasOverlay = pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition;
+
+	for ( uint64_t ulModifier : GetBackend()->GetSupportedModifiers( pOutput->uOutputFormat ) )
+	{
+		if ( ulModifier == DRM_FORMAT_MOD_INVALID )
+			continue;
+		if ( bHasOverlay &&
+		     !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( pOutput->uOutputFormatOverlay ), ulModifier ) )
+			continue;
+		modifiers.push_back( ulModifier );
+	}
+
+	return modifiers;
+}
+
+static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
+	const CVulkanTexture::createFlags &outputImageflags,
+	uint32_t uWidth, uint32_t uHeight )
+{
+	const std::vector<uint64_t> modifiers = vulkan_get_backend_scanout_modifiers( pOutput );
+	if ( modifiers.empty() )
+		return false;
+
+	const bool bHasOverlay = pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition;
+	for ( size_t i = 0; i < pOutput->outputImages.size(); i++ )
+	{
+		wlr_dmabuf_attributes dmabuf = {};
+		if ( !GetBackend()->CreateScanoutDmabuf(
+			uWidth, uHeight, pOutput->uOutputFormat, modifiers, &dmabuf ) )
+			return false;
+
+		pOutput->outputImages[i] = new CVulkanTexture();
+		bool bSuccess = pOutput->outputImages[i]->BInit(
+			uWidth, uHeight, 1u, pOutput->uOutputFormat,
+			outputImageflags, &dmabuf );
+
+		if ( bSuccess && bHasOverlay )
+		{
+			wlr_dmabuf_attributes overlayDmabuf = dmabuf;
+			overlayDmabuf.format = pOutput->uOutputFormatOverlay;
+			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
+			bSuccess = pOutput->outputImagesPartialOverlay[i]->BInit(
+				uWidth, uHeight, 1u, pOutput->uOutputFormatOverlay,
+				outputImageflags, &overlayDmabuf );
+		}
+
+		wlr_dmabuf_attributes_finish( &dmabuf );
+		if ( !bSuccess )
+			return false;
+	}
+
+	return true;
+}
+
 static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 {
 	CVulkanTexture::createFlags outputImageflags;
@@ -3310,6 +3413,22 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	uint32_t uOutputHeight = g_nOutputHeight;
 	if ( g_uOutputRotation & 1u )
 		std::swap( uOutputWidth, uOutputHeight );
+
+	if ( GetBackend()->UsesBackendAllocatedScanout() )
+	{
+		if ( vulkan_make_backend_output_images( pOutput, outputImageflags, uOutputWidth, uOutputHeight ) )
+		{
+			// Oh no.
+			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+			return true;
+		}
+
+		vk_log.errorf( "Failed to create NVIDIA GBM scanout buffers; falling back to Vulkan scanout allocation." );
+		for ( auto &pImage : pOutput->outputImages )
+			pImage = nullptr;
+		for ( auto &pImage : pOutput->outputImagesPartialOverlay )
+			pImage = nullptr;
+	}
 
 	pOutput->outputImages[0] = new CVulkanTexture();
 	bool bSuccess = pOutput->outputImages[0]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
